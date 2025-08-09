@@ -1,0 +1,225 @@
+{
+  "schemaVersion": "0.3",
+  "description": "Incident containment + forensics collection for EC2 instance.\nParameters:\n  - InstanceId: EC2 instance to act on\n  - QuarantineSecurityGroup: ID of quarantine security group (single)\n  - ForensicS3Bucket: S3 bucket to upload logs\n  - CreateSnapshots: \"true\" or \"false\" to snapshot attached EBS volumes\n  - AutomationAssumeRole: Role ARN SSM should assume to perform EC2/EBS actions\n  - PubTopicArn: SNS Topic ARN to publish notification",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "InstanceId": {
+      "type": "String",
+      "description": "Target EC2 instanceId"
+    },
+    "QuarantineSecurityGroup": {
+      "type": "String",
+      "description": "Security Group ID to apply to instance"
+    },
+    "ForensicS3Bucket": {
+      "type": "String",
+      "description": "S3 bucket for forensic artifacts"
+    },
+    "CreateSnapshots": {
+      "type": "String",
+      "allowedValues": ["true", "false"],
+      "default": "true",
+      "description": "Whether to create EBS snapshots"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "IAM role for automation actions"
+    },
+    "PubTopicArn": {
+      "type": "String",
+      "description": "SNS Topic ARN to publish notification"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "DescribeInstance",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": ["{{ InstanceId }}"]
+      },
+      "outputs": [
+        {
+          "Name": "InstanceJson",
+          "Selector": "$.Reservations[0].Instances[0]",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "SetPlatform",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "set_platform",
+        "Script": "import json\ndef set_platform(events, context):\n    inst = json.loads(events['InstanceJson'])\n    platform = inst.get('PlatformDetails','Linux/UNIX')\n    volumes = []\n    for dev in inst.get('BlockDeviceMappings',[]):\n        vol = dev.get('Ebs',{}).get('VolumeId')\n        if vol:\n            volumes.append(vol)\n    return {\"Platform\": platform, \"VolumeIds\": volumes}"
+      },
+      "outputs": [
+        {
+          "Name": "Platform",
+          "Selector": "$.Payload.Platform",
+          "Type": "String"
+        },
+        {
+          "Name": "VolumeIds",
+          "Selector": "$.Payload.VolumeIds",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "QuarantineInstance",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "ModifyInstanceAttribute",
+        "InstanceId": "{{ InstanceId }}",
+        "Groups": ["{{ QuarantineSecurityGroup }}"]
+      }
+    },
+    {
+      "name": "TagInstance",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "CreateTags",
+        "ResourceId": "{{ InstanceId }}",
+        "Tags": [
+          {
+            "Key": "InvestigationStatus",
+            "Value": "Quarantined"
+          },
+          {
+            "Key": "QuarantineTimestamp",
+            "Value": "{{ automation:executionStartTime }}"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PlatformBranch",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ SetPlatform.Platform }}",
+            "StringEquals": "Linux/UNIX",
+            "NextStep": "CollectLinux"
+          },
+          {
+            "Variable": "{{ SetPlatform.Platform }}",
+            "StringEquals": "Windows",
+            "NextStep": "CollectWindows"
+          }
+        ],
+        "Default": "SnapshotBranch"
+      }
+    },
+    {
+      "name": "CollectLinux",
+      "action": "aws:runCommand",
+      "onFailure": "Continue",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": ["{{ InstanceId }}"],
+        "Parameters": {
+          "commands": [
+            "set -e",
+            "OUTDIR=/tmp/forensics_$(date +%s)",
+            "mkdir -p $OUTDIR",
+            "cp -r /var/log/* $OUTDIR/ 2>/dev/null || true",
+            "ps aux > $OUTDIR/ps.txt || true",
+            "ss -tunap > $OUTDIR/ss.txt || true",
+            "iptables-save > $OUTDIR/iptables.txt || true",
+            "history -w $OUTDIR/bash_history || true",
+            "tar -czf /tmp/forensics.tar.gz -C /tmp $(basename $OUTDIR) || true",
+            "aws s3 cp /tmp/forensics.tar.gz s3://{{ ForensicS3Bucket }}/{{ InstanceId }}/forensics-$(date +%s).tar.gz || true"
+          ]
+        }
+      }
+    },
+    {
+      "name": "CollectWindows",
+      "action": "aws:runCommand",
+      "onFailure": "Continue",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": ["{{ InstanceId }}"],
+        "Parameters": {
+          "commands": [
+            "$outdir = \"C:\\forensics_$(Get-Date -UFormat %s)\"",
+            "New-Item -ItemType Directory -Path $outdir -Force",
+            "wevtutil epl System $outdir\\System.evtx",
+            "wevtutil epl Security $outdir\\Security.evtx",
+            "wevtutil epl Application $outdir\\Application.evtx",
+            "Get-Process | Sort-Object CPU -Descending | Select-Object -First 200 | Out-File $outdir\\processes.txt",
+            "Get-NetTCPConnection | Out-File $outdir\\netconns.txt",
+            "Get-Content $env:USERPROFILE\\AppData\\Roaming\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt -ErrorAction SilentlyContinue | Out-File $outdir\\powershell_history.txt",
+            "Compress-Archive -Path $outdir -DestinationPath C:\\forensics.zip -Force",
+            "aws s3 cp C:\\forensics.zip s3://{{ ForensicS3Bucket }}/{{ InstanceId }}/forensics-$(Get-Date -UFormat %s).zip"
+          ]
+        }
+      }
+    },
+    {
+      "name": "SnapshotBranch",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ CreateSnapshots }}",
+            "StringEquals": "true",
+            "NextStep": "CreateSnapshots"
+          }
+        ],
+        "Default": "PublishNotification"
+      }
+    },
+    {
+      "name": "CreateSnapshots",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVolumes",
+        "Filters": [
+          {
+            "Name": "attachment.instance-id",
+            "Values": ["{{ InstanceId }}"]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "AttachedVolumes",
+          "Selector": "$..VolumeId",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "SnapshotVolumesLoop",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "snapshot_volumes",
+        "Script": "import boto3, json\ndef snapshot_volumes(events, context):\n    ec2 = boto3.client('ec2')\n    volume_ids = events.get('AttachedVolumes', [])\n    results = []\n    for v in volume_ids:\n        try:\n            resp = ec2.create_snapshot(VolumeId=v, Description=f\"IR-snapshot-{events.get('InstanceId')}\")\n            results.append({'VolumeId': v, 'SnapshotId': resp['SnapshotId']})\n        except Exception as e:\n            results.append({'VolumeId': v, 'Error': str(e)})\n    return {\"Snapshots\": results}"
+      }
+    },
+    {
+      "name": "PublishNotification",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "sns",
+        "Api": "Publish",
+        "TopicArn": "{{ PubTopicArn }}",
+        "Message": "{\"InstanceId\":\"{{ InstanceId }}\",\"ForensicS3Path\":\"s3://{{ ForensicS3Bucket }}/{{ InstanceId }}/\",\"Status\":\"Quarantined and artifacts collected\"}",
+        "Subject": "IR: Instance {{ InstanceId }} quarantined"
+      }
+    }
+  ]
+}
