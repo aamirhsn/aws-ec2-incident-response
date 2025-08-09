@@ -1,0 +1,28 @@
+{
+  "version": "0",
+  "id": "test-event",
+  "detail-type": "Security Hub Findings - Imported",
+  "source": "aws.securityhub",
+  "account": "123456789012",
+  "time": "2025-08-09T00:00:00Z",
+  "region": "us-east-1",
+  "resources": [],
+  "detail": {
+    "findings": [
+      {
+        "Types": ["Unusual Behaviors/EC2"],
+        "Title": "Test suspicious EC2",
+        "Description": "Simulated finding - trigger IR automation",
+        "Resources": [
+          {
+            "Type": "AwsEc2Instance",
+            "Id": "i-0123456789abcdef0"
+          }
+        ],
+        "Severity": {
+          "Label": "HIGH"
+        }
+      }
+    ]
+  }
+}
