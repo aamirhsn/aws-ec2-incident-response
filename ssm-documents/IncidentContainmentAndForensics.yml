@@ -1,0 +1,187 @@
+---
+schemaVersion: '0.3'
+description: |
+  Incident containment + forensics collection for EC2 instance.
+  Parameters:
+    - InstanceId: EC2 instance to act on
+    - QuarantineSecurityGroup: ID of quarantine security group (single)
+    - ForensicS3Bucket: S3 bucket to upload logs
+    - CreateSnapshots: "true" or "false" to snapshot attached EBS volumes
+    - AutomationAssumeRole: Role ARN SSM should assume to perform EC2/EBS actions
+    - PubTopicArn: SNS Topic ARN to publish notification
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  InstanceId:
+    type: String
+    description: "Target EC2 instanceId"
+  QuarantineSecurityGroup:
+    type: String
+    description: "Security Group ID to apply to instance"
+  ForensicS3Bucket:
+    type: String
+    description: "S3 bucket for forensic artifacts"
+  CreateSnapshots:
+    type: String
+    allowedValues: ["true","false"]
+    default: "true"
+    description: "Whether to create EBS snapshots"
+  AutomationAssumeRole:
+    type: String
+    description: "IAM role for automation actions"
+  PubTopicArn:
+    type: String
+    description: "SNS Topic ARN to publish notification"
+mainSteps:
+  - name: DescribeInstance
+    action: aws:executeAwsApi
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      InstanceIds: ["{{ InstanceId }}"]
+    outputs:
+      - Name: InstanceJson
+        Selector: "$.Reservations[0].Instances[0]"
+        Type: String
+
+  - name: SetPlatform
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.8
+      Handler: set_platform
+      Script: |
+        import json
+        def set_platform(events, context):
+            inst = json.loads(events['InstanceJson'])
+            platform = inst.get('PlatformDetails','Linux/UNIX')
+            volumes = []
+            for dev in inst.get('BlockDeviceMappings',[]):
+                vol = dev.get('Ebs',{}).get('VolumeId')
+                if vol:
+                    volumes.append(vol)
+            return {"Platform": platform, "VolumeIds": volumes}
+    outputs:
+      - Name: Platform
+        Selector: "$.Payload.Platform"
+        Type: String
+      - Name: VolumeIds
+        Selector: "$.Payload.VolumeIds"
+        Type: StringList
+
+  - name: QuarantineInstance
+    action: aws:executeAwsApi
+    onFailure: Continue
+    inputs:
+      Service: ec2
+      Api: ModifyInstanceAttribute
+      InstanceId: "{{ InstanceId }}"
+      Groups: ["{{ QuarantineSecurityGroup }}"]
+
+  - name: TagInstance
+    action: aws:executeAwsApi
+    inputs:
+      Service: ec2
+      Api: CreateTags
+      ResourceId: "{{ InstanceId }}"
+      Tags:
+        - Key: InvestigationStatus
+          Value: Quarantined
+        - Key: QuarantineTimestamp
+          Value: "{{ automation:executionStartTime }}"
+
+  - name: CollectLinux
+    action: aws:runCommand
+    onFailure: Continue
+    precondition:
+      StringEquals:
+        - "{{ Platform }}"
+        - "Linux/UNIX"
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds: ["{{ InstanceId }}"]
+      Parameters:
+        commands:
+          - "set -e"
+          - "OUTDIR=/tmp/forensics_$(date +%s)"
+          - "mkdir -p $OUTDIR"
+          - "cp -r /var/log/* $OUTDIR/ 2>/dev/null || true"
+          - "ps aux > $OUTDIR/ps.txt || true"
+          - "ss -tunap > $OUTDIR/ss.txt || true"
+          - "iptables-save > $OUTDIR/iptables.txt || true"
+          - "history -w $OUTDIR/bash_history || true"
+          - "tar -czf /tmp/forensics.tar.gz -C /tmp $(basename $OUTDIR) || true"
+          - "aws s3 cp /tmp/forensics.tar.gz s3://{{ ForensicS3Bucket }}/{{ InstanceId }}/forensics-$(date +%s).tar.gz || true"
+
+  - name: CollectWindows
+    action: aws:runCommand
+    onFailure: Continue
+    precondition:
+      StringEquals:
+        - "{{ Platform }}"
+        - "Windows"
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds: ["{{ InstanceId }}"]
+      Parameters:
+        commands:
+          - "$outdir = \"C:\\forensics_$(Get-Date -UFormat %s)\""
+          - "New-Item -ItemType Directory -Path $outdir -Force"
+          - "wevtutil epl System $outdir\\System.evtx"
+          - "wevtutil epl Security $outdir\\Security.evtx"
+          - "wevtutil epl Application $outdir\\Application.evtx"
+          - "Get-Process | Sort-Object CPU -Descending | Select-Object -First 200 | Out-File $outdir\\processes.txt"
+          - "Get-NetTCPConnection | Out-File $outdir\\netconns.txt"
+          - "Get-Content $env:USERPROFILE\\AppData\\Roaming\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt -ErrorAction SilentlyContinue | Out-File $outdir\\powershell_history.txt"
+          - "Compress-Archive -Path $outdir -DestinationPath C:\\forensics.zip -Force"
+          - "aws s3 cp C:\\forensics.zip s3://{{ ForensicS3Bucket }}/{{ InstanceId }}/forensics-$(Get-Date -UFormat %s).zip"
+
+  - name: CreateSnapshots
+    action: aws:executeAwsApi
+    onFailure: Continue
+    precondition:
+      StringEquals:
+        - "{{ CreateSnapshots }}"
+        - "true"
+    inputs:
+      Service: ec2
+      Api: DescribeVolumes
+      Filters:
+        - Name: attachment.instance-id
+          Values:
+            - "{{ InstanceId }}"
+    outputs:
+      - Name: AttachedVolumes
+        Selector: "$.Volumes[*].VolumeId"
+        Type: StringList
+
+  - name: SnapshotVolumesLoop
+    action: aws:executeScript
+    onFailure: Continue
+    inputs:
+      Runtime: python3.8
+      Handler: snapshot_volumes
+      Script: |
+        import boto3, json
+        def snapshot_volumes(events, context):
+            ec2 = boto3.client('ec2')
+            volume_ids = events.get('AttachedVolumes', [])
+            results = []
+            for v in volume_ids:
+                try:
+                    resp = ec2.create_snapshot(VolumeId=v, Description=f"IR-snapshot-{events.get('InstanceId')}")
+                    results.append({'VolumeId': v, 'SnapshotId': resp['SnapshotId']})
+                except Exception as e:
+                    results.append({'VolumeId': v, 'Error': str(e)})
+            return {"Snapshots": results}
+    inputs:
+      InstanceId: "{{ InstanceId }}"
+      AttachedVolumes: "{{ AttachedVolumes }}"
+
+  - name: PublishNotification
+    action: aws:executeAwsApi
+    onFailure: Continue
+    inputs:
+      Service: sns
+      Api: Publish
+      TopicArn: "{{ PubTopicArn }}"
+      Message: "{\"InstanceId\":\"{{ InstanceId }}\",\"ForensicS3Path\":\"s3://{{ ForensicS3Bucket }}/{{ InstanceId }}/\",\"Status\":\"Quarantined and artifacts collected\"}"
+      Subject: "IR: Instance {{ InstanceId }} quarantined"
